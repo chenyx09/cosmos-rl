@@ -487,11 +487,30 @@ def setup_redis_barrier(worker) -> None:
             config = getattr(worker, "config", None)
             if config and hasattr(config, "redis") and config.redis:
                 redis_port = int(config.redis)
+            # Bound every blocking call (INCR, EXPIRE, PUBLISH, GET, pubsub
+            # SUBSCRIBE/UNSUBSCRIBE/get_message) so a dead or unresponsive
+            # socket cannot park the WST forever inside r2r_barrier's INCR.
+            # Without a timeout the WST hangs in recv(), the barrier's
+            # try/except never fires (no exception is raised, just an
+            # indefinite syscall), and the worker silently stops
+            # participating in R2R rounds — leaving the rest of the fleet
+            # waiting at the barrier for the full 120 s timeout every step.
+            # Observed at dp_shard_size > 1 where longer training steps let
+            # idle sockets get reaped by middleware between R2R cycles.
+            # With a timeout, INCR raises ``redis.TimeoutError``, the
+            # existing except clause logs and "skips" the barrier for this
+            # worker, and ``_execute_r2r`` proceeds to the NCCL broadcast
+            # like every other worker does.
             r2r_redis = _redis_lib.Redis(
                 host=redis_host,
                 port=redis_port,
                 db=redis_db,
                 decode_responses=True,
+                socket_timeout=10.0,
+                socket_connect_timeout=10.0,
+                socket_keepalive=True,
+                health_check_interval=30,
+                retry_on_timeout=False,
             )
             r2r_redis.ping()
             worker._r2r_redis = r2r_redis
